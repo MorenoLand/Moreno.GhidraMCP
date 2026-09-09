@@ -1,15 +1,14 @@
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
-[![GitHub release (latest by date)](https://img.shields.io/github/v/release/LaurieWired/GhidraMCP)](https://github.com/LaurieWired/GhidraMCP/releases)
-[![GitHub stars](https://img.shields.io/github/stars/LaurieWired/GhidraMCP)](https://github.com/LaurieWired/GhidraMCP/stargazers)
-[![GitHub forks](https://img.shields.io/github/forks/LaurieWired/GhidraMCP)](https://github.com/LaurieWired/GhidraMCP/network/members)
-[![GitHub contributors](https://img.shields.io/github/contributors/LaurieWired/GhidraMCP)](https://github.com/LaurieWired/GhidraMCP/graphs/contributors)
-[![Follow @lauriewired](https://img.shields.io/twitter/follow/lauriewired?style=social)](https://twitter.com/lauriewired)
+[![GitHub release (latest by date)](https://img.shields.io/github/v/release/Denveous/GhidraMCP)](https://github.com/Denveous/GhidraMCP/releases)
+[![GitHub stars](https://img.shields.io/github/stars/Denveous/GhidraMCP)](https://github.com/Denveous/GhidraMCP/stargazers)
+[![GitHub forks](https://img.shields.io/github/forks/Denveous/GhidraMCP)](https://github.com/Denveous/GhidraMCP/network/members)
+[![GitHub contributors](https://img.shields.io/github/contributors/Denveous/GhidraMCP)](https://github.com/Denveous/GhidraMCP/graphs/contributors)
 
 ![ghidra_MCP_logo](https://github.com/user-attachments/assets/4986d702-be3f-4697-acce-aea55cd79ad3)
 
 
-# ghidraMCP
-ghidraMCP is an Model Context Protocol server for allowing LLMs to autonomously reverse engineer applications. It exposes numerous tools from core Ghidra functionality to MCP clients.
+# MCP bridge for Ghidra reverse engineering
+GhidraMCP is a Model Context Protocol server that exposes core Ghidra functionality to MCP clients for reverse engineering applications.
 
 https://github.com/user-attachments/assets/36080514-f227-44bd-af84-78e29ee1d7f9
 
@@ -21,9 +20,13 @@ MCP Server + Ghidra Plugin
 - Automatically rename methods and data
 - List methods, classes, imports, and exports
 
+## Program targeting
+
+Call `get_open_programs` first and use its `path`, `name`, or `executablePath` as the required `program` argument on every program-analysis tool. The target is attached to each MCP request, so requests from different sessions do not change Ghidra's current program; requests for the same program are serialized and requests for different programs can run concurrently. `switch_program` is reserved for explicitly changing the Ghidra UI's current program.
+
 # MCP Tools
 
-ghidraMCP exposes 78 tools through MCP for LLM-assisted reverse engineering:
+GhidraMCP exposes 86 tools through MCP for LLM-assisted reverse engineering:
 
 ## Listing & Navigation
 
@@ -41,7 +44,7 @@ ghidraMCP exposes 78 tools through MCP for LLM-assisted reverse engineering:
 | `get_current_function` | Get the function currently selected by user |
 | `get_entry_points` | Get all entry points (external symbols) |
 | `get_open_programs` | List all programs in the current Ghidra project (open and available) |
-| `switch_program` | Switch active program or open a new program from the project |
+| `switch_program` | Explicitly change the Ghidra UI's current program or open a new program |
 | `get_external_functions` | List all external/imported functions with pagination |
 
 ## Decompilation & Disassembly
@@ -156,12 +159,12 @@ ghidraMCP exposes 78 tools through MCP for LLM-assisted reverse engineering:
 - MCP [SDK](https://github.com/modelcontextprotocol/python-sdk)
 
 ## Ghidra
-First, download the latest [release](https://github.com/LaurieWired/GhidraMCP/releases) from this repository. This contains the Ghidra plugin and Python MCP client. Then, you can directly import the plugin into Ghidra.
+First, download the latest [release](https://github.com/Denveous/GhidraMCP/releases) from this repository. This contains the Ghidra plugin and Python MCP client. Then, you can directly import the plugin into Ghidra.
 
 1. Run Ghidra
 2. Select `File` -> `Install Extensions`
 3. Click the `+` button
-4. Select the `GhidraMCP-1-2.zip` (or your chosen version) from the downloaded release
+4. Select the downloaded GhidraMCP extension ZIP
 5. Restart Ghidra
 6. Make sure the GhidraMCPPlugin is enabled in `File` -> `Configure` -> `Developer`
 7. *Optional*: Configure the port in Ghidra with `Edit` -> `Tool Options` -> `GhidraMCP HTTP Server`
@@ -188,7 +191,7 @@ To set up Claude Desktop as a Ghidra MCP client, go to `Claude` -> `Settings` ->
       "args": [
         "/ABSOLUTE_PATH_TO/bridge_mcp_ghidra.py",
         "--ghidra-server",
-        "http://127.0.0.1:8080/"
+        "http://127.0.0.1:8179/"
       ]
     }
   }
@@ -200,13 +203,13 @@ Alternatively, edit this file directly:
 /Users/YOUR_USER/Library/Application Support/Claude/claude_desktop_config.json
 ```
 
-The server IP and port are configurable and should be set to point to the target Ghidra instance. If not set, both will default to localhost:8080.
+The server IP and port are configurable and should be set to point to the target Ghidra instance. The default Ghidra plugin endpoint is `http://127.0.0.1:8179/`.
 
 ## Example 2: Cline
 To use GhidraMCP with [Cline](https://cline.bot), this requires manually running the MCP server as well. First run the following command:
 
 ```
-python bridge_mcp_ghidra.py --transport sse --mcp-host 127.0.0.1 --mcp-port 8081 --ghidra-server http://127.0.0.1:8080/
+python bridge_mcp_ghidra.py --transport sse --mcp-host 127.0.0.1 --mcp-port 8081 --ghidra-server http://127.0.0.1:8179/
 ```
 
 The only *required* argument is the transport. If all other arguments are unspecified, they will default to the above. Once the MCP server is running, open up Cline and select `MCP Servers` at the top.
@@ -226,12 +229,12 @@ Another MCP client that supports multiple models on the backend is [5ire](https:
 3. Command: `python /ABSOLUTE_PATH_TO/bridge_mcp_ghidra.py`
 
 # Building from Source
-Build with Maven by running:
+Build with Java 21 and Gradle by running from this directory:
 
-`mvn clean package assembly:single`
+`.\gradlew.bat buildExtension`
 
-The generated zip file includes the built Ghidra plugin and its resources. These files are required for Ghidra to recognize the new extension.
+The generated extension ZIP is written to `dist/` and includes the built Ghidra plugin and Python MCP bridge.
 
-- lib/GhidraMCP.jar
-- extensions.properties
-- Module.manifest
+- `lib/GhidraMCP.jar`
+- `extension.properties`
+- `Module.manifest`

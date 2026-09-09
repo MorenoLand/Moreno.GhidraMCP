@@ -1,7 +1,9 @@
 package com.lauriewired;
 
 import com.google.gson.Gson;
+import com.sun.net.httpserver.HttpContext;
 import com.sun.net.httpserver.HttpExchange;
+import com.sun.net.httpserver.HttpHandler;
 import com.sun.net.httpserver.HttpServer;
 import ghidra.app.decompiler.DecompInterface;
 import ghidra.app.decompiler.DecompileResults;
@@ -65,6 +67,8 @@ import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.Executor;
+import java.util.concurrent.locks.ReentrantLock;
 
 
 @PluginInfo(
@@ -77,6 +81,8 @@ import java.util.concurrent.atomic.AtomicReference;
 public class GhidraMCPPlugin extends Plugin {
 
 	private HttpServer server;
+	private final ThreadLocal<Program> requestProgram = new ThreadLocal<>();
+	private final Map<Program, ReentrantLock> programLocks = Collections.synchronizedMap(new IdentityHashMap<>());
 	private static final String OPTION_CATEGORY_NAME = "GhidraMCP HTTP Server";
 	private static final String PORT_OPTION_NAME = "Server Port";
 	private static final int DEFAULT_PORT = 8179;
@@ -115,7 +121,7 @@ public class GhidraMCPPlugin extends Plugin {
 			server = null;
 		}
 
-		server = HttpServer.create(new InetSocketAddress(port), 0);
+		server = new ProgramAwareHttpServer(HttpServer.create(new InetSocketAddress(port), 0));
 
 		// Each listing endpoint uses offset & limit from query params:
 		server.createContext("/methods", exchange -> {
@@ -696,6 +702,93 @@ public class GhidraMCPPlugin extends Plugin {
 		}, "GhidraMCP-HTTP-Server").start();
 	}
 
+	private final class ProgramAwareHttpServer extends HttpServer {
+		private final HttpServer delegate;
+
+		private ProgramAwareHttpServer(HttpServer delegate) {
+			this.delegate = delegate;
+		}
+
+		@Override
+		public void bind(InetSocketAddress address, int backlog) throws IOException {
+			delegate.bind(address, backlog);
+		}
+
+		@Override
+		public void start() {
+			delegate.start();
+		}
+
+		@Override
+		public void stop(int delay) {
+			delegate.stop(delay);
+		}
+
+		@Override
+		public HttpContext createContext(String path, HttpHandler handler) {
+			return delegate.createContext(path, exchange -> {
+				Map<String, String> queryParams = parseQueryParams(exchange);
+				String programIdentifier = queryParams.get("program");
+				boolean programIndependent = "/get_open_programs".equals(path) || "/switch_program".equals(path);
+				if (!programIndependent) {
+					if (programIdentifier == null || programIdentifier.isBlank()) {
+						sendResponse(exchange, "Error: program is required");
+						return;
+					}
+					Program program = findOpenProgram(programIdentifier);
+					if (program == null) {
+						sendResponse(exchange, "Error: Program is not open: " + programIdentifier);
+						return;
+					}
+					ReentrantLock programLock;
+					synchronized (programLocks) {
+						programLock = programLocks.computeIfAbsent(program, ignored -> new ReentrantLock(true));
+					}
+					programLock.lock();
+					requestProgram.set(program);
+					try {
+						handler.handle(exchange);
+					} finally {
+						requestProgram.remove();
+						programLock.unlock();
+					}
+					return;
+				}
+				handler.handle(exchange);
+			});
+		}
+
+		@Override
+		public HttpContext createContext(String path) {
+			return delegate.createContext(path);
+		}
+
+		@Override
+		public void removeContext(String path) throws IllegalArgumentException {
+			delegate.removeContext(path);
+		}
+
+		@Override
+		public void removeContext(HttpContext context) {
+			delegate.removeContext(context);
+		}
+
+		@Override
+		public InetSocketAddress getAddress() {
+			return delegate.getAddress();
+		}
+
+		@Override
+		public void setExecutor(Executor executor) {
+			delegate.setExecutor(executor);
+		}
+
+		@Override
+		public Executor getExecutor() {
+			return delegate.getExecutor();
+		}
+	}
+
 	// ----------------------------------------------------------------------------------
 	// Pagination-aware listing methods
 	// ----------------------------------------------------------------------------------
@@ -1144,10 +1237,10 @@ public class GhidraMCPPlugin extends Plugin {
 		if (query != null) {
 			String[] pairs = query.split("&");
 			for (String p : pairs) {
-				String[] kv = p.split("=");
+				String[] kv = p.split("=", 2);
 				if (kv.length == 2) {
 					try {
-						result.put(kv[0], java.net.URLDecoder.decode(kv[1], StandardCharsets.UTF_8));
+						result.put(java.net.URLDecoder.decode(kv[0], StandardCharsets.UTF_8), java.net.URLDecoder.decode(kv[1], StandardCharsets.UTF_8));
 					} catch (Exception e) {
 						result.put(kv[0], kv[1]);
 					}
@@ -1229,8 +1322,24 @@ public class GhidraMCPPlugin extends Plugin {
 	}
 
 	public Program getCurrentProgram() {
+		Program requestedProgram = requestProgram.get();
+		if (requestedProgram != null) return requestedProgram;
 		ProgramManager pm = tool.getService(ProgramManager.class);
 		return pm != null ? pm.getCurrentProgram() : null;
+	}
+
+	private Program findOpenProgram(String identifier) {
+		ProgramManager pm = tool.getService(ProgramManager.class);
+		if (pm == null || identifier == null) return null;
+		for (Program program : pm.getAllOpenPrograms()) {
+			DomainFile domainFile = program.getDomainFile();
+			String path = domainFile != null ? domainFile.getPathname() : null;
+			String executablePath = program.getExecutablePath();
+			if (identifier.equals(path) || identifier.equals(program.getName()) || identifier.equals(executablePath)) {
+				return program;
+			}
+		}
+		return null;
 	}
 
 	private String getFunctionByAddress(String addressStr) {
@@ -1249,20 +1358,24 @@ public class GhidraMCPPlugin extends Plugin {
 	private String getCurrentAddress() {
 		Program program = getCurrentProgram();
 		if (program == null) return "No program loaded";
+		if (!isUiCurrentProgram(program)) return "No UI current address for requested program";
 		CodeViewerService cv = tool.getService(CodeViewerService.class);
 		if (cv == null) return "No code viewer service";
 		ProgramLocation loc = cv.getCurrentLocation();
 		if (loc == null) return "No current address";
+		if (loc.getProgram() != program) return "No UI current address for requested program";
 		return loc.getAddress().toString();
 	}
 
 	private String getCurrentFunction() {
 		Program program = getCurrentProgram();
 		if (program == null) return "No program loaded";
+		if (!isUiCurrentProgram(program)) return "No UI current function for requested program";
 		CodeViewerService cv = tool.getService(CodeViewerService.class);
 		if (cv == null) return "No code viewer service";
 		ProgramLocation loc = cv.getCurrentLocation();
 		if (loc == null) return "No current address";
+		if (loc.getProgram() != program) return "No UI current function for requested program";
 		Address currentAddr = loc.getAddress();
 		Function func = program.getFunctionManager().getFunctionContaining(currentAddr);
 		if (func == null) return "No function at current address";
@@ -3103,6 +3216,7 @@ public class GhidraMCPPlugin extends Plugin {
 	private String goToAddress(String addressStr) {
 		Program program = getCurrentProgram();
 		if (program == null) return gson.toJson(Map.of("status", "error", "message", "No program loaded"));
+		if (!isUiCurrentProgram(program)) return gson.toJson(Map.of("status", "error", "message", "UI navigation requires the requested program to be current"));
 		if (addressStr == null || addressStr.isEmpty()) {
 			return gson.toJson(Map.of("status", "error", "message", "Address is required"));
 		}
@@ -3120,6 +3234,11 @@ public class GhidraMCPPlugin extends Plugin {
 		} catch (Exception e) {
 			return gson.toJson(Map.of("status", "error", "message", e.getMessage()));
 		}
+	}
+
+	private boolean isUiCurrentProgram(Program program) {
+		ProgramManager pm = tool.getService(ProgramManager.class);
+		return pm != null && pm.getCurrentProgram() == program;
 	}
 
 	private void sendResponse(HttpExchange exchange, String response) throws IOException {

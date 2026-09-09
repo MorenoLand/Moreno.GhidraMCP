@@ -4,3 +4,11 @@ apply from: 'F:/Software/Ghidra/support/buildExtension.gradle'
 jar {
 	archiveBaseName = 'GhidraMCP'
 }
+
+tasks.named('buildExtension') {
+	eachFile { details ->
+		String sourcePath = details.file.canonicalPath
+		String buildPath = file('build').canonicalPath + File.separator
+		if (details.file.name == 'nul' || (!sourcePath.startsWith(buildPath) && (sourcePath.contains(File.separator + 'lib' + File.separator) || details.file.name.endsWith('.jar') || details.file.name.endsWith('.bak')))) details.exclude()
+	}
+}

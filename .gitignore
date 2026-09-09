@@ -13,6 +13,7 @@
 *.iml
 *.iws
 out/
+*.bak
 
 # Eclipse
 .project
@@ -51,4 +52,15 @@ replay_pid*
 
 # Third party JAR files from Ghidra
 lib/*.jar
+/*.jar
+
+# Gradle and local generated output
+.gradle/
+build/
+dist/
+temp_extract/
+**/__pycache__/
+*.py[cod]
+nul
+_nul
 

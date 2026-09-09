@@ -11,6 +11,9 @@ import json
 import requests
 import argparse
 import logging
+import contextvars
+import functools
+import inspect
 
 from mcp.server.fastmcp import FastMCP
 
@@ -18,7 +21,42 @@ DEFAULT_GHIDRA_SERVER = "http://127.0.0.1:8179/"
 
 logger = logging.getLogger(__name__)
 
-mcp = FastMCP("ghidra-mcp")
+active_program = contextvars.ContextVar("ghidra_active_program", default=None)
+
+class ProgramAwareFastMCP(FastMCP):
+    def tool(self, name=None, title=None, description=None, annotations=None, icons=None, meta=None, structured_output=None):
+        register = super().tool(name=name, title=title, description=description, annotations=annotations, icons=icons, meta=meta, structured_output=structured_output)
+
+        def decorator(fn):
+            if fn.__name__ in {"get_open_programs", "switch_program"}:
+                return register(fn)
+            signature = inspect.signature(fn)
+            if "program" in signature.parameters:
+                return register(fn)
+            program_parameter = inspect.Parameter("program", inspect.Parameter.KEYWORD_ONLY, annotation=str)
+            parameters = list(signature.parameters.values())
+            for index, parameter in enumerate(parameters):
+                if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+                    parameters.insert(index, program_parameter)
+                    break
+            else:
+                parameters.append(program_parameter)
+
+            @functools.wraps(fn)
+            def wrapped(*args, program, **kwargs):
+                token = active_program.set(program)
+                try:
+                    return fn(*args, **kwargs)
+                finally:
+                    active_program.reset(token)
+
+            wrapped.__annotations__ = {**getattr(fn, "__annotations__", {}), "program": str}
+            wrapped.__signature__ = signature.replace(parameters=parameters)
+            return register(wrapped)
+
+        return decorator
+
+mcp = ProgramAwareFastMCP("ghidra-mcp")
 
 # Initialize ghidra_server_url with default value
 ghidra_server_url = DEFAULT_GHIDRA_SERVER
@@ -27,8 +65,10 @@ def safe_get(endpoint: str, params: dict = None) -> list:
     """
     Perform a GET request with optional query parameters.
     """
-    if params is None:
-        params = {}
+    params = {**(params or {})}
+    program = active_program.get()
+    if program:
+        params["program"] = program
 
     url = f"{ghidra_server_url}/{endpoint}"
 
@@ -43,11 +83,12 @@ def safe_get(endpoint: str, params: dict = None) -> list:
         return [f"Request failed: {e!r}"]
 
 def safe_post(endpoint: str, data: dict | str) -> str:
+    params = {"program": active_program.get()} if active_program.get() else None
     try:
         if isinstance(data, dict):
-            response = requests.post(f"{ghidra_server_url}/{endpoint}", json=data, timeout=5)
+            response = requests.post(f"{ghidra_server_url}/{endpoint}", params=params, json=data, timeout=5)
         else:
-            response = requests.post(f"{ghidra_server_url}/{endpoint}", data=data.encode("utf-8"), timeout=5)
+            response = requests.post(f"{ghidra_server_url}/{endpoint}", params=params, data=data.encode("utf-8"), timeout=5)
         response.encoding = 'utf-8'
         if response.ok:
             return response.text.strip()
@@ -57,8 +98,9 @@ def safe_post(endpoint: str, data: dict | str) -> str:
         return f"Request failed: {e!r}"
 
 def safe_post_json(endpoint: str, data: dict) -> dict:
+    params = {"program": active_program.get()} if active_program.get() else None
     try:
-        response = requests.post(f"{ghidra_server_url}/{endpoint}", json=data, timeout=5)
+        response = requests.post(f"{ghidra_server_url}/{endpoint}", params=params, json=data, timeout=5)
         response.encoding = 'utf-8'
         if response.ok:
             import json
@@ -248,9 +290,7 @@ def search_bytes(pattern: str, limit: int = 100) -> list:
     Search for byte patterns in the program. Pattern is hex bytes separated by spaces, use ? for wildcards.
     Example: "41 B8 88 13 00 00 E8 ? ? ? ?"
     """
-    import urllib.parse
-    params = urllib.parse.urlencode({"pattern": pattern, "limit": limit}, quote_via=urllib.parse.quote)
-    return safe_get(f"search_bytes?{params}")
+    return safe_get("search_bytes", {"pattern": pattern, "limit": limit})
 
 @mcp.tool()
 def get_references(address: str) -> list:
@@ -269,7 +309,11 @@ def get_function_bytes(address: str, length: int = 32) -> dict:
     import requests
     url = f"{ghidra_server_url}/get_function_bytes"
     try:
-        response = requests.get(url, params={"address": address, "length": length}, timeout=5)
+        params = {"address": address, "length": length}
+        program = active_program.get()
+        if program:
+            params["program"] = program
+        response = requests.get(url, params=params, timeout=5)
         response.encoding = 'utf-8'
         if response.ok:
             return json.loads(response.text)
@@ -835,21 +879,22 @@ def clear_analysis(address: str) -> str:
     return safe_post("clear_analysis", {"address": address})
 
 def main():
+    global ghidra_server_url
     parser = argparse.ArgumentParser(description="MCP server for Ghidra")
     parser.add_argument("--ghidra-server", type=str, default=DEFAULT_GHIDRA_SERVER,
                         help=f"Ghidra server URL, default: {DEFAULT_GHIDRA_SERVER}")
     parser.add_argument("--mcp-host", type=str, default="127.0.0.1",
-                        help="Host to run MCP server on (only used for sse), default: 127.0.0.1")
+                        help="Host to run MCP server on (used for network transports), default: 127.0.0.1")
     parser.add_argument("--mcp-port", type=int,
-                        help="Port to run MCP server on (only used for sse), default: 8081")
-    parser.add_argument("--transport", type=str, default="stdio", choices=["stdio", "sse"],
+                        help="Port to run MCP server on (used for network transports), default: 8081")
+    parser.add_argument("--transport", type=str, default="stdio", choices=["stdio", "sse", "streamable-http"],
                         help="Transport protocol for MCP, default: stdio")
     args = parser.parse_args()
     
     if args.ghidra_server:
-        ghidra_server_url = args.ghidra_server
+        ghidra_server_url = args.ghidra_server.rstrip("/")
     
-    if args.transport == "sse":
+    if args.transport in ("sse", "streamable-http"):
         try:
             # Set up logging
             log_level = logging.INFO
@@ -869,10 +914,11 @@ def main():
                 mcp.settings.port = 8081
 
             logger.info(f"Connecting to Ghidra server at {ghidra_server_url}")
-            logger.info(f"Starting MCP server on http://{mcp.settings.host}:{mcp.settings.port}/sse")
+            endpoint = "/sse" if args.transport == "sse" else "/mcp"
+            logger.info(f"Starting MCP server on http://{mcp.settings.host}:{mcp.settings.port}{endpoint}")
             logger.info(f"Using transport: {args.transport}")
 
-            mcp.run(transport="sse")
+            mcp.run(transport=args.transport)
         except KeyboardInterrupt:
             logger.info("Server stopped by user")
     else:
